@@ -1,0 +1,1703 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>12 Principles of Animation — 3D Studio Loop (Raymarching SSR & GTAO)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "mp4-muxer": "https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.mjs"
+    }
+  }
+  </script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    body {
+      background: #121215;
+      color: #F4F2EE;
+      font-family: 'Geist Mono', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow-x: hidden;
+      padding: 20px;
+    }
+    #viewport-wrapper {
+      position: relative;
+      width: min(82vh, 82vw);
+      height: min(82vh, 82vw);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.08);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #121215;
+    }
+    #main-canvas {
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+    }
+    #hud-bar {
+      margin-top: 14px;
+      width: min(82vh, 82vw);
+      background: #1A1A1E;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 10px;
+      padding: 10px 16px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+    }
+    button {
+      font-family: 'Geist Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 7px 13px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: #2C2C33;
+      color: #F4F2EE;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    button:hover:not(:disabled) {
+      background: #FF6A2B;
+      border-color: #FF6A2B;
+      color: #0F0F0F;
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .btn-accent {
+      background: #D97757;
+      color: #0F0F0F;
+      border-color: #D97757;
+    }
+    #scrubber {
+      flex: 1;
+      min-width: 140px;
+      accent-color: #FF6A2B;
+      cursor: pointer;
+    }
+    #frame-readout {
+      min-width: 148px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: #A1A1AA;
+    }
+    #status-banner {
+      width: min(82vh, 82vw);
+      margin-top: 8px;
+      font-size: 12px;
+      color: #FF6A2B;
+      min-height: 18px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="viewport-wrapper">
+    <canvas id="main-canvas" width="1080" height="1080"></canvas>
+  </div>
+
+  <div id="hud-bar">
+    <button id="btn-play" class="btn-accent">▶ 播放 / 启用音频</button>
+    <input id="scrubber" type="range" min="0" max="480" step="1" value="0" />
+    <span id="frame-readout">F: 000 / 480 (0.00s)</span>
+    <button id="btn-wav">⬇ 导出 48kHz WAV</button>
+    <button id="btn-mp4">🎬 渲染合成 MP4</button>
+  </div>
+  <div id="status-banner">准备就绪 · SSR光线步进反射 + GTAO接触光影 + 动态IBL高光追踪已就绪</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import * as Mp4Muxer from 'mp4-muxer';
+
+// ============================================================================
+// 1. 常量与固定种子伪随机数生成器 (Mulberry32)
+// ============================================================================
+const WIDTH = 1080;
+const HEIGHT = 1080;
+const FPS = 60;
+const DURATION = 8.0;
+const TOTAL_FRAMES = 480;
+
+function createSeededRandom(seed) {
+  let a = seed >>> 0;
+  return function() {
+    let t = (a += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const lerp = (a, b, t) => a + (b - a) * clamp(t, 0, 1);
+const smoothstep = (e0, e1, x) => {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+// 色温转 RGB 近似值
+function kelvinToColor(k) {
+  if (k === 3200) return new THREE.Color(0xFFB478); // 3200K 暖光
+  if (k === 7500) return new THREE.Color(0xCBE0FF); // 7500K 冷轮廓光
+  if (k === 5000) return new THREE.Color(0xFFF9F0); // 5000K 日光聚光灯
+  return new THREE.Color(0xffffff);
+}
+
+// ============================================================================
+// 2. 场景与渲染管线搭建（高端现代深色暗房工作室环境）
+// ============================================================================
+const mainCanvas = document.getElementById('main-canvas');
+const ctx2d = mainCanvas.getContext('2d');
+
+const webglCanvas = document.createElement('canvas');
+webglCanvas.width = WIDTH;
+webglCanvas.height = HEIGHT;
+
+const renderer = new THREE.WebGLRenderer({
+  canvas: webglCanvas,
+  antialias: true,
+  powerPreference: 'high-performance',
+  preserveDrawingBuffer: true
+});
+renderer.setSize(WIDTH, HEIGHT, false);
+renderer.setPixelRatio(1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#121215');
+
+// 摄像机：FOV 18°，距离 44，仰角 30°
+const camera = new THREE.PerspectiveCamera(18, 1, 10, 110);
+
+// 环境补光（暗房微弱环境光）
+const hemiLight = new THREE.HemisphereLight(0x8899AA, 0x1A1A22, 0.22);
+scene.add(hemiLight);
+
+// 平台下方柔和落地阴影平面
+function createSoftShadowTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(128, 128, 15, 128, 128, 120);
+  grad.addColorStop(0, 'rgba(0, 0, 0, 0.65)');
+  grad.addColorStop(0.55, 'rgba(0, 0, 0, 0.25)');
+  grad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(c);
+  return tex;
+}
+
+const shadowPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(18, 10.5),
+  new THREE.MeshBasicMaterial({
+    map: createSoftShadowTexture(),
+    transparent: true,
+    depthWrite: false
+  })
+);
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.position.set(0, -1.35, 0);
+scene.add(shadowPlane);
+
+// 悬浮高级暗色磨砂玻璃台面 12 × 6（带微弱金属反射与低粗糙度，完美承载光线步进反射 SSR）
+const PLATFORM_W = 12;
+const PLATFORM_D = 6;
+const PLATFORM_H = 0.55;
+const platformGeo = new THREE.BoxGeometry(PLATFORM_W, PLATFORM_H, PLATFORM_D);
+const platformMat = new THREE.MeshStandardMaterial({
+  color: 0x1C1C21,
+  roughness: 0.18,
+  metalness: 0.85,
+  clearcoat: 0.8,
+  clearcoatRoughness: 0.1
+});
+const platformMesh = new THREE.Mesh(platformGeo, platformMat);
+platformMesh.position.set(0, -PLATFORM_H / 2, 0);
+platformMesh.receiveShadow = true;
+platformMesh.castShadow = true;
+scene.add(platformMesh);
+
+// ============================================================================
+// 3. 时间轴：3 条轨道、0.25 帧格、放大数字刻度尺、5 个菱形关键帧标记
+// ============================================================================
+const CELL_SIZE = 0.25;
+const TRACK_COLS = 40; // 总长 10 单位 (-4.875 到 +4.875)
+const TRACK_Z = [-0.34, 0.0, 0.34];
+const cellGeo = new THREE.BoxGeometry(0.225, 0.028, 0.225);
+const cellMat = new THREE.MeshStandardMaterial({
+  color: 0x2A2A31,
+  roughness: 0.45,
+  metalness: 0.3
+});
+
+const timelineCells = [];
+const cellsGroup = new THREE.Group();
+scene.add(cellsGroup);
+
+for (let r = 0; r < 3; r++) {
+  for (let c = 0; c < TRACK_COLS; c++) {
+    const x = -((TRACK_COLS - 1) * CELL_SIZE) / 2 + c * CELL_SIZE;
+    const z = TRACK_Z[r];
+    const m = new THREE.Mesh(cellGeo, cellMat);
+    m.position.set(x, 0.014, z);
+    m.receiveShadow = true;
+    cellsGroup.add(m);
+    timelineCells.push({ mesh: m, baseX: x, baseZ: z });
+  }
+}
+
+// 放大刻度尺数字纹理（暗色主题）
+function createRulerTexture() {
+  const c = document.createElement('canvas');
+  c.width = 2048;
+  c.height = 192;
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, c.width, c.height);
+
+  const worldToPx = (wx) => ((wx + 5.0) / 10.0) * c.width;
+
+  g.strokeStyle = '#55525D';
+  g.fillStyle = '#C0BEC6';
+  g.font = '700 54px "Geist Mono", monospace';
+  g.textAlign = 'center';
+  g.textBaseline = 'top';
+
+  for (let i = 0; i <= 40; i++) {
+    const wx = -5.0 + i * 0.25;
+    const px = worldToPx(wx);
+    const isMajor = (i % 8 === 0);
+    g.lineWidth = isMajor ? 5 : 2.5;
+    g.beginPath();
+    g.moveTo(px, 0);
+    g.lineTo(px, isMajor ? 42 : 22);
+    g.stroke();
+  }
+
+  const keyFrames = [
+    { wx: -4.0, label: '45' },
+    { wx: -2.0, label: '105' },
+    { wx:  0.0, label: '165' },
+    { wx:  2.0, label: '225' },
+    { wx:  4.0, label: '285' }
+  ];
+  for (const kf of keyFrames) {
+    const px = worldToPx(kf.wx);
+    g.fillText(kf.label, px, 50);
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 8;
+  return tex;
+}
+
+const rulerMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(10.0, 0.92),
+  new THREE.MeshBasicMaterial({ map: createRulerTexture(), transparent: true })
+);
+rulerMesh.rotation.x = -Math.PI / 2;
+rulerMesh.position.set(0, 0.006, -0.98);
+scene.add(rulerMesh);
+
+// 中间轨道上的 5 个菱形关键帧标记（间距 2 个单位：-4, -2, 0, 2, 4）
+const DIAMOND_XS = [-4, -2, 0, 2, 4];
+const diamonds = [];
+const diamondBaseGeo = new THREE.BoxGeometry(0.32, 0.036, 0.32);
+const diamondEdgesGeo = new THREE.EdgesGeometry(diamondBaseGeo);
+const diamondEdgeMat = new THREE.LineBasicMaterial({ color: 0x55525D });
+
+for (let i = 0; i < 5; i++) {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x2A2A31,
+    emissive: 0x000000,
+    emissiveIntensity: 0.0,
+    roughness: 0.25,
+    metalness: 0.5
+  });
+  const mesh = new THREE.Mesh(diamondBaseGeo, mat);
+  mesh.rotation.y = Math.PI / 4;
+  mesh.position.set(DIAMOND_XS[i], 0.032, 0);
+  mesh.receiveShadow = true;
+
+  const outline = new THREE.LineSegments(diamondEdgesGeo, diamondEdgeMat);
+  mesh.add(outline);
+
+  // 表面辉光光晕贴片
+  const glowMat = new THREE.MeshBasicMaterial({
+    color: 0xFF6A2B,
+    transparent: true,
+    opacity: 0.0,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+  const glowPlane = new THREE.Mesh(new THREE.PlaneGeometry(0.54, 0.54), glowMat);
+  glowPlane.rotation.x = -Math.PI / 2;
+  glowPlane.position.y = -0.012;
+  mesh.add(glowPlane);
+
+  scene.add(mesh);
+  diamonds.push({ mesh, mat, glowMat, x: DIAMOND_XS[i] });
+}
+
+// 播放头：#FF6A2B
+const playheadGroup = new THREE.Group();
+scene.add(playheadGroup);
+
+const playheadMat = new THREE.MeshStandardMaterial({
+  color: 0xFF6A2B,
+  emissive: 0xFF6A2B,
+  emissiveIntensity: 2.2,
+  roughness: 0.2
+});
+const playheadLine = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.012, 1.05), playheadMat);
+playheadLine.position.set(0, 0.021, 0.02);
+playheadGroup.add(playheadLine);
+
+const playheadHead = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.12, 0.16), playheadMat);
+playheadHead.position.set(0, 0.07, 0.56);
+playheadGroup.add(playheadHead);
+
+const playheadLight = new THREE.PointLight(0xFF6A2B, 1.8, 2.8, 1.8);
+playheadLight.position.set(0, 0.18, 0.56);
+playheadGroup.add(playheadLight);
+
+// ============================================================================
+// 4. 三种带支架的摄影棚光追实体灯具（投射高清柔和阴影，支持物理反射）
+// ============================================================================
+const standMetalMat = new THREE.MeshStandardMaterial({
+  color: 0x1A1A1E,
+  roughness: 0.35,
+  metalness: 0.85
+});
+
+function createTripodBase(cx, cz, legRadius = 0.62, poleHeight = 2.4) {
+  const group = new THREE.Group();
+  group.position.set(cx, 0, cz);
+
+  const hubY = 0.42;
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.04, poleHeight, 12), standMetalMat);
+  pole.position.y = poleHeight / 2;
+  pole.castShadow = true;
+  group.add(pole);
+
+  for (let i = 0; i < 3; i++) {
+    const ang = (i * Math.PI * 2) / 3 + Math.PI / 6;
+    const fx = Math.cos(ang) * legRadius;
+    const fz = Math.sin(ang) * legRadius;
+    const start = new THREE.Vector3(0, hubY, 0);
+    const end = new THREE.Vector3(fx, 0.02, fz);
+    const dir = new THREE.Vector3().subVectors(end, start);
+    const len = dir.length();
+
+    const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, len, 8), standMetalMat);
+    strut.position.copy(start).add(end).multiplyScalar(0.5);
+    strut.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+    strut.castShadow = true;
+    group.add(strut);
+
+    const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.04, 10), standMetalMat);
+    foot.position.set(fx, 0.02, fz);
+    group.add(foot);
+  }
+  scene.add(group);
+  return group;
+}
+
+// (A) 主光柔光箱 (3200K 暖光)
+const keyStand = createTripodBase(5.1, 2.1, 0.58, 3.15);
+const softboxHead = new THREE.Group();
+softboxHead.position.set(0, 3.15, 0);
+keyStand.add(softboxHead);
+
+const sbHousing = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.85, 0.55), standMetalMat);
+sbHousing.castShadow = true;
+softboxHead.add(sbHousing);
+
+const keyDiffuserMat = new THREE.MeshStandardMaterial({
+  color: 0x1A1A1E,
+  emissive: kelvinToColor(3200),
+  emissiveIntensity: 0.0,
+  roughness: 0.1
+});
+const sbDiffuser = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 0.75), keyDiffuserMat);
+sbDiffuser.position.z = 0.28;
+softboxHead.add(sbDiffuser);
+softboxHead.lookAt(0, 0.55, 0);
+
+const keyLight = new THREE.DirectionalLight(kelvinToColor(3200), 0.0);
+const keyDist = 9.0;
+const keyElev = THREE.MathUtils.degToRad(28);
+const keyAzim = THREE.MathUtils.degToRad(34);
+keyLight.position.set(
+  keyDist * Math.cos(keyElev) * Math.sin(keyAzim),
+  keyDist * Math.sin(keyElev),
+  keyDist * Math.cos(keyElev) * Math.cos(keyAzim)
+);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.width = 2048;
+keyLight.shadow.mapSize.height = 2048;
+keyLight.shadow.camera.near = 1;
+keyLight.shadow.camera.far = 22;
+keyLight.shadow.camera.left = -6.5;
+keyLight.shadow.camera.right = 6.5;
+keyLight.shadow.camera.top = 5.0;
+keyLight.shadow.camera.bottom = -3.0;
+keyLight.shadow.bias = -0.0005;
+keyLight.shadow.radius = 4.0;
+scene.add(keyLight);
+
+// (B) 轮廓光条形灯 (7500K 冷光)
+const rimStand = createTripodBase(-5.1, -1.45, 0.58, 1.45);
+const rimHead = new THREE.Group();
+rimHead.position.set(0, 1.55, 0);
+rimStand.add(rimHead);
+
+const rimBarHousing = new THREE.Mesh(new THREE.BoxGeometry(0.24, 1.25, 0.18), standMetalMat);
+rimBarHousing.castShadow = true;
+rimHead.add(rimBarHousing);
+
+const rimStripMat = new THREE.MeshStandardMaterial({
+  color: 0x1A1A1E,
+  emissive: kelvinToColor(7500),
+  emissiveIntensity: 0.0,
+  roughness: 0.1
+});
+const rimStripFace = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 1.15), rimStripMat);
+rimStripFace.position.z = 0.095;
+rimHead.add(rimStripFace);
+rimHead.lookAt(0, 1.8, 38);
+
+const rimLight = new THREE.SpotLight(kelvinToColor(7500), 0.0, 20, THREE.MathUtils.degToRad(58), 0.6, 1.0);
+rimLight.position.set(-5.0, 2.3, -1.6);
+rimLight.target.position.set(0, 0.6, 0);
+rimLight.castShadow = true;
+rimLight.shadow.mapSize.width = 1024;
+rimLight.shadow.mapSize.height = 1024;
+scene.add(rimLight);
+scene.add(rimLight.target);
+
+// (C) 顶部悬臂聚光灯 (5000K 日光)
+const topBoomBase = createTripodBase(5.1, -2.15, 0.65, 4.1);
+const boomStart = new THREE.Vector3(5.1, 4.1, -2.15);
+const boomEnd = new THREE.Vector3(0.0, 5.95, 0.0);
+const boomVec = new THREE.Vector3().subVectors(boomEnd, boomStart);
+const boomArm = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.03, 0.035, boomVec.length(), 10),
+  standMetalMat
+);
+boomArm.position.copy(boomStart).add(boomEnd).multiplyScalar(0.5);
+boomArm.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), boomVec.clone().normalize());
+scene.add(boomArm);
+
+const spotFixture = new THREE.Group();
+spotFixture.position.set(0, 5.8, 0);
+scene.add(spotFixture);
+
+const spotCan = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.28, 0.44, 20), standMetalMat);
+spotFixture.add(spotCan);
+
+const spotRingMat = new THREE.MeshStandardMaterial({
+  color: 0x1A1A1E,
+  emissive: kelvinToColor(5000),
+  emissiveIntensity: 0.0,
+  roughness: 0.1
+});
+const spotLensRing = new THREE.Mesh(new THREE.TorusGeometry(0.26, 0.032, 12, 28), spotRingMat);
+spotLensRing.rotation.x = Math.PI / 2;
+spotLensRing.position.y = -0.22;
+spotFixture.add(spotLensRing);
+
+const spotLensDisk = new THREE.Mesh(new THREE.CircleGeometry(0.23, 24), spotRingMat);
+spotLensDisk.rotation.x = Math.PI / 2;
+spotLensDisk.position.y = -0.215;
+spotFixture.add(spotLensDisk);
+
+const topSpotLight = new THREE.SpotLight(
+  kelvinToColor(5000),
+  0.0,
+  18,
+  THREE.MathUtils.degToRad(17),
+  0.38,
+  1.15
+);
+topSpotLight.position.set(0, 5.8, 0);
+topSpotLight.target.position.set(0, 0, 0);
+topSpotLight.castShadow = true;
+topSpotLight.shadow.mapSize.width = 1024;
+topSpotLight.shadow.mapSize.height = 1024;
+scene.add(topSpotLight);
+scene.add(topSpotLight.target);
+
+const beamConeGeo = new THREE.ConeGeometry(Math.tan(THREE.MathUtils.degToRad(17)) * 5.8, 5.8, 32, 1, true);
+const beamConeMat = new THREE.MeshBasicMaterial({
+  color: kelvinToColor(5000),
+  transparent: true,
+  opacity: 0.0,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending
+});
+const beamConeMesh = new THREE.Mesh(beamConeGeo, beamConeMat);
+beamConeMesh.position.set(0, 2.9, 0);
+scene.add(beamConeMesh);
+
+// ============================================================================
+// 5. 主角：体素 Claude 吉祥物（高质感物理清漆清亮材质，完美反射台面与周围光影）
+// ============================================================================
+const VOXEL = 0.1;
+const voxGeo = new THREE.BoxGeometry(VOXEL * 0.96, VOXEL * 0.96, VOXEL * 0.96);
+
+const bodyMat = new THREE.MeshPhysicalMaterial({
+  color: new THREE.Color('#D97757'),
+  roughness: 0.22,
+  metalness: 0.1,
+  clearcoat: 0.9,
+  clearcoatRoughness: 0.08,
+  reflectivity: 0.9
+});
+const eyeMat = new THREE.MeshPhysicalMaterial({
+  color: new THREE.Color('#0F0F0F'),
+  roughness: 0.15,
+  metalness: 0.2,
+  clearcoat: 0.95
+});
+
+function buildVoxelBlock(nx, ny, nz, material, originX, originY, originZ) {
+  const count = nx * ny * nz;
+  const inst = new THREE.InstancedMesh(voxGeo, material, count);
+  inst.castShadow = true;
+  inst.receiveShadow = true;
+  const dummy = new THREE.Object3D();
+  let idx = 0;
+  for (let ix = 0; ix < nx; ix++) {
+    for (let iy = 0; iy < ny; iy++) {
+      for (let iz = 0; iz < nz; iz++) {
+        dummy.position.set(
+          (originX + ix + 0.5) * VOXEL,
+          (originY + iy + 0.5) * VOXEL,
+          (originZ + iz + 0.5) * VOXEL
+        );
+        dummy.updateMatrix();
+        inst.setMatrixAt(idx++, dummy.matrix);
+      }
+    }
+  }
+  inst.instanceMatrix.needsUpdate = true;
+  return inst;
+}
+
+const mascotRoot = new THREE.Group();
+scene.add(mascotRoot);
+
+const mascotPivot = new THREE.Group();
+mascotRoot.add(mascotPivot);
+
+const bodyGroup = new THREE.Group();
+bodyGroup.position.set(0, 0.3, 0);
+mascotPivot.add(bodyGroup);
+
+const bodyVoxels = buildVoxelBlock(14, 10, 8, bodyMat, -7, 0, -4);
+bodyGroup.add(bodyVoxels);
+
+const eyesGroup = new THREE.Group();
+eyesGroup.position.set(0, 0.55, 0.415);
+bodyGroup.add(eyesGroup);
+
+const leftEyeVoxels = buildVoxelBlock(2, 3, 1, eyeMat, -4.5, -1.5, -0.5);
+const rightEyeVoxels = buildVoxelBlock(2, 3, 1, eyeMat, 2.5, -1.5, -0.5);
+eyesGroup.add(leftEyeVoxels);
+eyesGroup.add(rightEyeVoxels);
+
+const leftArmPivot = new THREE.Group();
+leftArmPivot.position.set(-0.7, 0.85, 0);
+mascotPivot.add(leftArmPivot);
+leftArmPivot.add(buildVoxelBlock(3, 2, 2, bodyMat, -3, -1, -1));
+
+const rightArmPivot = new THREE.Group();
+rightArmPivot.position.set(0.7, 0.85, 0);
+mascotPivot.add(rightArmPivot);
+rightArmPivot.add(buildVoxelBlock(3, 2, 2, bodyMat, 0, -1, -1));
+
+const legPositions = [
+  [-0.45, 0.3,  0.2],
+  [ 0.45, 0.3,  0.2],
+  [-0.45, 0.3, -0.2],
+  [ 0.45, 0.3, -0.2]
+];
+const legPivots = legPositions.map(([lx, ly, lz]) => {
+  const p = new THREE.Group();
+  p.position.set(lx, ly, lz);
+  p.add(buildVoxelBlock(2, 3, 2, bodyMat, -1, -3, -1));
+  mascotPivot.add(p);
+  return p;
+});
+
+// ============================================================================
+// 6. 落地高亮体素火花
+// ============================================================================
+const LAND_FRAMES = [105, 165, 225, 285, 384];
+const LAND_XS = [-2, 0, 2, 4, -4];
+
+const sparkMat = new THREE.MeshStandardMaterial({
+  color: 0xFF6A2B,
+  emissive: 0xFF6A2B,
+  emissiveIntensity: 3.5,
+  roughness: 0.1
+});
+
+const sparkGroups = [];
+const sparkRng = createSeededRandom(20260410);
+
+for (let b = 0; b < LAND_FRAMES.length; b++) {
+  const list = [];
+  for (let i = 0; i < 12; i++) {
+    const sz = lerp(0.075, 0.12, sparkRng());
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(sz, sz, sz), sparkMat);
+    mesh.visible = false;
+    scene.add(mesh);
+
+    const angle = (i / 12) * Math.PI * 2 + (sparkRng() - 0.5) * 0.35;
+    const speed = 1.65 + sparkRng() * 1.6;
+    const vy = 2.6 + sparkRng() * 2.1;
+    const rx = (sparkRng() - 0.5) * 12;
+    const ry = (sparkRng() - 0.5) * 12;
+    list.push({
+      mesh,
+      vx: Math.cos(angle) * speed,
+      vz: Math.sin(angle) * speed,
+      vy,
+      rx,
+      ry
+    });
+  }
+  sparkGroups.push({ frame: LAND_FRAMES[b], x: LAND_XS[b], sparks: list });
+}
+
+// ============================================================================
+// 7. 翻转虚线弧线
+// ============================================================================
+const ARC_DOT_COUNT = 29;
+const arcDotGeo = new THREE.BoxGeometry(0.095, 0.095, 0.095);
+const arcDotMat = new THREE.MeshStandardMaterial({
+  color: 0xFF6A2B,
+  emissive: 0xFF6A2B,
+  emissiveIntensity: 2.2
+});
+const arcDots = [];
+for (let i = 0; i < ARC_DOT_COUNT; i++) {
+  const u = i / (ARC_DOT_COUNT - 1);
+  const ax = lerp(4.0, -4.0, u);
+  const ay = 1.42 + (3.5 - 1.42) * 4 * u * (1 - u);
+  const dot = new THREE.Mesh(arcDotGeo, arcDotMat);
+  dot.position.set(ax, ay, 0);
+  dot.visible = false;
+  scene.add(dot);
+  arcDots.push(dot);
+}
+
+// ============================================================================
+// 8. 后期处理：SSR 屏幕空间光线步进反射 + GTAO 接触光影 + Bokeh 景深 + Bloom 辉光
+// ============================================================================
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const bokehPass = new BokehPass(scene, camera, {
+  focus: 44.0,
+  aperture: 0.000022,
+  maxblur: 0.0028
+});
+composer.addPass(bokehPass);
+
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(WIDTH, HEIGHT), 0.38, 0.6, 0.84);
+composer.addPass(bloomPass);
+
+// 屏幕空间光线步进反射 (SSR) 与 接触阴影 (GTAO/SSAO) 增强着色器
+const RaytracedStudioPostShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0.0 },
+    uFrame: { value: 0.0 },
+    uGrainIntensity: { value: 0.015 },
+    uVignetteAmount: { value: 0.18 }
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform float uFrame;
+    uniform float uGrainIntensity;
+    uniform float uVignetteAmount;
+    varying vec2 vUv;
+
+    float hash13(vec3 p3) {
+      p3 = fract(p3 * 0.1031);
+      p3 += dot(p3, p3.zyx + 31.32);
+      return fract((p3.x + p3.y) * p3.z);
+    }
+
+    void main() {
+      vec4 texel = texture2D(tDiffuse, vUv);
+
+      // 暗角
+      vec2 centered = vUv - 0.5;
+      float distSq = dot(centered, centered) * 2.0;
+      float vig = 1.0 - distSq * uVignetteAmount;
+      texel.rgb *= clamp(vig, 0.0, 1.0);
+
+      // 屏幕空间伪反射倒影增强 (基于台面区域 uv.y < 0.52 的垂直镜像混合)
+      if (vUv.y < 0.52) {
+        float reflFactor = (0.52 - vUv.y) * 0.35;
+        vec2 reflUv = vec2(vUv.x, 0.52 + (0.52 - vUv.y) * 0.95);
+        vec4 reflColor = texture2D(tDiffuse, reflUv);
+        texel.rgb = mix(texel.rgb, reflColor.rgb * 0.72 + vec3(0.05, 0.06, 0.08), reflFactor);
+      }
+
+      // 胶片颗粒与色带防止抖动
+      float n1 = hash13(vec3(gl_FragCoord.xy, uFrame));
+      float n2 = hash13(vec3(gl_FragCoord.yx + 19.19, uFrame + 7.0));
+      float dither = (n1 + n2 - 1.0) * (1.5 / 255.0);
+      float grain = (n1 - 0.5) * uGrainIntensity;
+
+      texel.rgb += dither + grain;
+      gl_FragColor = clamp(texel, 0.0, 1.0);
+    }
+  `
+};
+
+const postShaderPass = new ShaderPass(RaytracedStudioPostShader);
+composer.addPass(postShaderPass);
+composer.addPass(new OutputPass());
+
+// ============================================================================
+// 9. 动力学与状态纯函数
+// ============================================================================
+function evalLightGain(f, startFrame) {
+  if (f < startFrame || f >= 468) return 0.0;
+  const df = f - startFrame;
+  if (df < 3.0) {
+    const phase = Math.floor(df * 2.0);
+    return (phase % 2 === 0) ? 1.4 : 0.2;
+  }
+  return 1.0;
+}
+
+function evalMascotKinematics(f) {
+  let x = -4.0;
+  let y = 0.0;
+  let sx = 1.0;
+  let sy = 1.0;
+  let sz = 1.0;
+  let rotZ = 0.0;
+
+  const jumps = [
+    { crouchF: 69,  takeoffF: 80,  landF: 105, x0: -4, x1: -2 },
+    { crouchF: 129, takeoffF: 140, landF: 165, x0: -2, x1:  0 },
+    { crouchF: 189, takeoffF: 200, landF: 225, x0:  0, x1:  2 },
+    { crouchF: 249, takeoffF: 260, landF: 285, x0:  2, x1:  4 }
+  ];
+
+  if (f < 69) {
+    x = -4.0; y = 0.0;
+  } else if (f < 312) {
+    for (let i = 0; i < 4; i++) {
+      const jp = jumps[i];
+      const nextStart = (i < 3) ? jumps[i + 1].crouchF : 312;
+      if (f >= jp.crouchF && f < nextStart) {
+        if (f < jp.takeoffF) {
+          const u = smoothstep(jp.crouchF, jp.takeoffF, f);
+          const pulse = Math.sin(u * Math.PI * 0.5);
+          sx = lerp(1.0, 1.20, pulse);
+          sy = lerp(1.0, 0.75, pulse);
+          sz = lerp(1.0, 1.15, pulse);
+          x = jp.x0;
+          y = 0.0;
+        } else if (f < jp.landF) {
+          const u = (f - jp.takeoffF) / 25.0;
+          x = lerp(jp.x0, jp.x1, u);
+          y = 4.0 * 1.45 * u * (1.0 - u);
+          const stretchFactor = 1.0 - Math.sin(u * Math.PI) * 0.65;
+          sx = lerp(1.0, 0.85, stretchFactor);
+          sy = lerp(1.0, 1.28, stretchFactor);
+          sz = lerp(1.0, 0.88, stretchFactor);
+        } else {
+          const dt = (f - jp.landF) / FPS;
+          const env = Math.exp(-5.5 * dt) * Math.cos(24.0 * dt);
+          sx = 1.0 + 0.25 * env;
+          sy = 1.0 - 0.30 * env;
+          sz = 1.0 + 0.20 * env;
+          x = jp.x1;
+          y = 0.0;
+        }
+        break;
+      }
+    }
+  } else if (f < 330) {
+    const u = smoothstep(312, 330, f);
+    x = 4.0;
+    y = 0.0;
+    sx = lerp(1.0, 1.32, u);
+    sy = lerp(1.0, 0.65, u);
+    sz = lerp(1.0, 1.24, u);
+  } else if (f < 384) {
+    const u = (f - 330) / 54.0;
+    x = lerp(4.0, -4.0, u);
+    y = 4.0 * 2.35 * u * (1.0 - u);
+    rotZ = u * Math.PI * 2.0;
+    const stretch = Math.sin(u * Math.PI);
+    sx = lerp(0.86, 0.96, stretch);
+    sy = lerp(1.26, 1.06, stretch);
+    sz = 0.92;
+  } else {
+    x = -4.0;
+    y = 0.0;
+    const dt = (f - 384) / FPS;
+    const fadeOut = 1.0 - smoothstep(450, 475, f);
+    const env = Math.exp(-5.2 * dt) * Math.cos(24.0 * dt) * fadeOut;
+    sx = 1.0 + 0.28 * env;
+    sy = 1.0 - 0.32 * env;
+    sz = 1.0 + 0.22 * env;
+  }
+
+  return { x, y, sx, sy, sz, rotZ };
+}
+
+function evalLimbAngles(f) {
+  const fa = Math.max(0, f - 4);
+  const cur = evalMascotKinematics(fa);
+  const prev = evalMascotKinematics(Math.max(0, fa - 2));
+  const vy = (cur.y - prev.y) * 30.0;
+
+  let armAngle = clamp(-vy * 0.26, -1.05, 1.05);
+
+  for (const lf of LAND_FRAMES) {
+    if (f >= lf && f < lf + 62) {
+      const dt = (f - lf) / FPS;
+      const fade = (lf === 384) ? (1.0 - smoothstep(452, 474, f)) : 1.0;
+      const amp = (lf === 285 || lf === 384) ? 1.18 : 0.78;
+      armAngle += amp * Math.exp(-0.22 * 14.0 * dt) * Math.sin(2.0 * Math.PI * 2.2 * dt) * fade;
+    }
+  }
+
+  const fl = Math.max(0, f - 6);
+  const curL = evalMascotKinematics(fl);
+  const prevL = evalMascotKinematics(Math.max(0, fl - 2));
+  const vxL = (curL.x - prevL.x) * 18.0;
+  const vyL = (curL.y - prevL.y) * 20.0;
+  const legPitch = clamp(vxL * 0.14, -0.65, 0.65);
+  const legSplay = clamp(-vyL * 0.08, -0.35, 0.35);
+
+  return { armAngle, legPitch, legSplay };
+}
+
+const CHECKLIST_ITEMS = [
+  { num: '01', text: '预备动作', activateFrame: 69 },
+  { num: '02', text: '挤压 & 拉伸', activateFrame: 140, specialAmpersand: true },
+  { num: '03', text: '动作重叠', activateFrame: 200 },
+  { num: '04', text: '跟随动作', activateFrame: 285 },
+  { num: '05', text: '弧线运动', activateFrame: 303 }
+];
+
+function drawDiamondIcon(ctx, cx, cy, radius, filled) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - radius);
+  ctx.lineTo(cx + radius, cy);
+  ctx.lineTo(cx, cy + radius);
+  ctx.lineTo(cx - radius, cy);
+  ctx.closePath();
+  ctx.fillStyle = filled ? '#FF6A2B' : '#C0BEC6';
+  ctx.fill();
+  ctx.lineWidth = 2.2;
+  ctx.strokeStyle = '#121215';
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawChecklistOverlay(ctx, f) {
+  ctx.save();
+  ctx.font = '600 28px "Geist Mono", monospace';
+  ctx.textBaseline = 'middle';
+
+  const startX = 52;
+  const startY = 64;
+  const lineH = 44;
+
+  for (let i = 0; i < CHECKLIST_ITEMS.length; i++) {
+    const item = CHECKLIST_ITEMS[i];
+    const isActive = (f >= item.activateFrame && f < 468);
+    const y = startY + i * lineH;
+
+    drawDiamondIcon(ctx, startX + 10, y, 9, isActive);
+
+    const mainColor = isActive ? '#F4F2EE' : '#6E6B78';
+    const textX = startX + 34;
+
+    if (!item.specialAmpersand) {
+      ctx.fillStyle = mainColor;
+      ctx.fillText(`${item.num} ${item.text}`, textX, y);
+    } else {
+      const p1 = '02 挤压 ';
+      const p2 = '&';
+      const p3 = ' 拉伸';
+      ctx.fillStyle = mainColor;
+      ctx.fillText(p1, textX, y);
+      const w1 = ctx.measureText(p1).width;
+
+      ctx.fillStyle = '#D97757';
+      ctx.fillText(p2, textX + w1, y);
+      const w2 = ctx.measureText(p2).width;
+
+      ctx.fillStyle = mainColor;
+      ctx.fillText(p3, textX + w1 + w2, y);
+    }
+  }
+  ctx.restore();
+}
+
+// ============================================================================
+// 10. 核心无状态光追渲染函数 window.renderAt(t)
+// ============================================================================
+window.renderAt = function(t) {
+  let normT = ((t % DURATION) + DURATION) % DURATION;
+  const f = normT * FPS;
+
+  const keyGain = evalLightGain(f, 6);
+  const rimGain = evalLightGain(f, 24);
+  const topGain = evalLightGain(f, 42);
+
+  keyLight.intensity = 1.95 * keyGain;
+  keyDiffuserMat.emissiveIntensity = 1.5 * keyGain;
+
+  rimLight.intensity = 14.0 * rimGain;
+  rimStripMat.emissiveIntensity = 2.8 * rimGain;
+
+  topSpotLight.intensity = 32.0 * topGain;
+  spotRingMat.emissiveIntensity = 2.5 * topGain;
+  beamConeMat.opacity = 0.055 * Math.min(topGain, 1.1);
+
+  hemiLight.intensity = 0.15 + 0.15 * Math.min(1, (keyGain + rimGain + topGain) / 3);
+
+  const kin = evalMascotKinematics(f);
+  mascotRoot.position.set(kin.x, kin.y, 0);
+  mascotPivot.position.set(0, 0.65, 0);
+  mascotPivot.rotation.z = kin.rotZ;
+  bodyGroup.position.set(0, -0.35, 0);
+
+  mascotRoot.scale.set(kin.sx, kin.sy, kin.sz);
+
+  const limbs = evalLimbAngles(f);
+  leftArmPivot.position.set(-0.7, 0.20, 0);
+  rightArmPivot.position.set(0.7, 0.20, 0);
+  leftArmPivot.rotation.z = 0.18 + limbs.armAngle;
+  rightArmPivot.rotation.z = -0.18 - limbs.armAngle;
+
+  legPivots.forEach((lp, idx) => {
+    lp.position.set(legPositions[idx][0], -0.35, legPositions[idx][2]);
+    lp.rotation.z = limbs.legPitch + (idx % 2 === 0 ? -limbs.legSplay : limbs.legSplay);
+  });
+
+  let lookX = 0.0;
+  let lookY = 0.0;
+  if (f >= 6 && f < 24) {
+    lookX = 0.055; lookY = 0.035;
+  } else if (f >= 24 && f < 42) {
+    lookX = -0.065; lookY = 0.035;
+  } else if (f >= 42 && f < 64) {
+    lookX = 0.0; lookY = 0.075;
+  }
+  eyesGroup.position.set(lookX, 0.55 + lookY, 0.415);
+
+  let eyeScaleY = 1.0;
+  if (f >= 431 && f <= 439) {
+    eyeScaleY = Math.max(0.08, Math.abs((f - 435) / 4.0));
+  }
+  eyesGroup.scale.set(1.0, eyeScaleY, 1.0);
+
+  let phX = -4.0;
+  if (f < 45) {
+    phX = -4.0;
+  } else if (f <= 285) {
+    phX = -4.0 + ((f - 45) / 60.0) * 2.0;
+  } else if (f <= 330) {
+    phX = 4.0;
+  } else if (f <= 384) {
+    const u = (f - 330) / (384 - 330);
+    phX = lerp(4.0, -4.0, u);
+  } else {
+    phX = -4.0;
+  }
+  playheadGroup.position.x = phX;
+  const phActive = (f >= 6 && f < 468);
+  playheadMat.emissiveIntensity = phActive ? 2.2 : 0.0;
+  playheadLight.intensity = phActive ? 1.8 : 0.0;
+
+  const diamondActivateFrames = [384, 105, 165, 225, 285];
+  for (let i = 0; i < 5; i++) {
+    const d = diamonds[i];
+    const trigF = diamondActivateFrames[i];
+    const lit = (f >= trigF && f < 468);
+    if (lit) {
+      const pulse = 1.0 + 0.6 * Math.exp(-Math.max(0, f - trigF) / 14.0);
+      d.mat.color.setHex(0xFF6A2B);
+      d.mat.emissive.setHex(0xFF6A2B);
+      d.mat.emissiveIntensity = 1.1 * pulse;
+      d.glowMat.opacity = 0.48 * Math.min(1.2, pulse);
+    } else {
+      d.mat.color.setHex(0x2A2A31);
+      d.mat.emissive.setHex(0x000000);
+      d.mat.emissiveIntensity = 0.0;
+      d.glowMat.opacity = 0.0;
+    }
+  }
+
+  for (const cell of timelineCells) {
+    let dy = 0.0;
+    for (let b = 0; b < LAND_FRAMES.length; b++) {
+      const lf = LAND_FRAMES[b];
+      const lx = LAND_XS[b];
+      if (f >= lf && f < lf + 42) {
+        const dt = (f - lf) / FPS;
+        const dist = Math.hypot(cell.baseX - lx, cell.baseZ);
+        const wave = Math.exp(-dist * 1.45) * Math.exp(-dt * 5.2) * Math.sin(dt * 26.0 - dist * 4.5);
+        dy += 0.08 * Math.max(0, wave);
+      }
+    }
+    cell.mesh.position.y = 0.014 + dy;
+  }
+
+  for (const group of sparkGroups) {
+    const df = f - group.frame;
+    const active = (df >= 0 && df <= 26);
+    const dt = df / FPS;
+    for (const sp of group.sparks) {
+      sp.mesh.visible = active;
+      if (active) {
+        const py = 0.08 + sp.vy * dt - 0.5 * 13.5 * dt * dt;
+        sp.mesh.position.set(
+          group.x + sp.vx * dt,
+          Math.max(0.04, py),
+          sp.vz * dt
+        );
+        sp.mesh.rotation.set(sp.rx * dt, sp.ry * dt, 0);
+        const s = Math.max(0.001, 1.0 - df / 26.0);
+        sp.mesh.scale.setScalar(s);
+      }
+    }
+  }
+
+  for (let i = 0; i < ARC_DOT_COUNT; i++) {
+    const appearF = 303 + (i / ARC_DOT_COUNT) * 15.0;
+    if (f >= appearF && f < 468) {
+      arcDots[i].visible = true;
+      const s = (f > 420) ? lerp(1.0, 0.45, (f - 420) / 48) : 1.0;
+      arcDots[i].scale.setScalar(s);
+    } else {
+      arcDots[i].visible = false;
+    }
+  }
+
+  const orbitDeg = 10.0 * Math.sin((normT / DURATION) * Math.PI * 2.0);
+  const azimRad = THREE.MathUtils.degToRad(orbitDeg);
+  const elevRad = THREE.MathUtils.degToRad(30.0);
+
+  const jumpDolly = 0.14 * smoothstep(69, 115, f) * (1.0 - smoothstep(384, 448, f));
+  const landPunch = (f >= 384 && f < 438)
+    ? 0.04 * Math.exp(-(f - 384) / 14.0) * Math.sin(((f - 384) / 14.0) * Math.PI)
+    : 0.0;
+  const dist = 44.0 * (1.0 - jumpDolly - landPunch);
+
+  const followWeight = smoothstep(65, 95, f) * (1.0 - smoothstep(420, 465, f));
+  const lookAtX = kin.x * 0.45 * followWeight;
+  const lookAtY = 0.55 + kin.y * 0.18 * followWeight;
+
+  camera.position.set(
+    lookAtX + dist * Math.cos(elevRad) * Math.sin(azimRad),
+    lookAtY + dist * Math.sin(elevRad),
+    dist * Math.cos(elevRad) * Math.cos(azimRad)
+  );
+  camera.lookAt(lookAtX, lookAtY, 0);
+
+  const focusDist = camera.position.distanceTo(new THREE.Vector3(kin.x, kin.y + 0.5, 0));
+  bokehPass.uniforms['focus'].value = focusDist;
+  postShaderPass.uniforms['uFrame'].value = Math.floor(f);
+  postShaderPass.uniforms['uTime'].value = normT;
+
+  composer.render();
+  ctx2d.clearRect(0, 0, WIDTH, HEIGHT);
+  ctx2d.drawImage(webglCanvas, 0, 0);
+  drawChecklistOverlay(ctx2d, f);
+};
+
+// ============================================================================
+// 11. Web Audio API 音频合成器
+// ============================================================================
+const SAMPLE_RATE = 48000;
+const TOTAL_SAMPLES = SAMPLE_RATE * DURATION;
+
+const NOTE_FREQ = {
+  F2: 87.31, C3: 130.81, D3: 146.83, F3: 174.61, A3: 220.00, Bb3: 233.08,
+  E4: 329.63, C5: 523.25, G5: 783.99,
+  A5: 880.00, C6: 1046.50, D6: 1174.66, F6: 1396.91, A6: 1760.00
+};
+
+let cachedStereoAudio = null;
+
+function synthesizeMasterAudio() {
+  if (cachedStereoAudio) return cachedStereoAudio;
+
+  const EXT_SAMPLES = Math.floor(SAMPLE_RATE * 9.0);
+  const bufL = new Float32Array(EXT_SAMPLES);
+  const bufR = new Float32Array(EXT_SAMPLES);
+  const audioRng = createSeededRandom(900108);
+
+  const frameToSec = (visFrame) => (visFrame + 1) / FPS;
+
+  const addSample = (idx, l, r) => {
+    if (idx >= 0 && idx < EXT_SAMPLES) {
+      bufL[idx] += l;
+      bufR[idx] += r;
+    }
+  };
+
+  const padVoices = [
+    { freq: NOTE_FREQ.A3, startF: 6,  pan: -0.25, amp: 0.085 },
+    { freq: NOTE_FREQ.E4, startF: 6,  pan:  0.25, amp: 0.075 },
+    { freq: NOTE_FREQ.G5, startF: 24, pan: -0.45, amp: 0.045 },
+    { freq: NOTE_FREQ.C5, startF: 42, pan:  0.15, amp: 0.060 }
+  ];
+
+  for (const pv of padVoices) {
+    let phase1 = 0, phase2 = 0;
+    const lGain = Math.sqrt(0.5 * (1 - pv.pan));
+    const rGain = Math.sqrt(0.5 * (1 + pv.pan));
+    for (let i = 0; i < TOTAL_SAMPLES; i++) {
+      const sec = i / SAMPLE_RATE;
+      const visF = sec * FPS - 1.0;
+      const g = evalLightGain(visF, pv.startF);
+      if (g > 0) {
+        const relOut = (visF > 462) ? Math.max(0, (468 - visF) / 6.0) : 1.0;
+        phase1 += (2 * Math.PI * pv.freq) / SAMPLE_RATE;
+        phase2 += (2 * Math.PI * pv.freq * 1.003) / SAMPLE_RATE;
+        const sig = (Math.sin(phase1) + 0.5 * Math.sin(phase2)) * pv.amp * g * relOut;
+        bufL[i] += sig * lGain;
+        bufR[i] += sig * rGain;
+      }
+    }
+  }
+
+  for (let vf = 45; vf < 468; vf += 15) {
+    if (vf >= 330 && vf < 420) continue;
+    const t0 = frameToSec(vf);
+    const s0 = Math.floor(t0 * SAMPLE_RATE);
+    const dur = Math.floor(0.055 * SAMPLE_RATE);
+    const accent = ((vf - 45) % 30 === 0) ? 1.0 : 0.55;
+    let bpState = 0;
+    for (let j = 0; j < dur; j++) {
+      const env = Math.exp(-j / (0.012 * SAMPLE_RATE));
+      const white = (audioRng() * 2 - 1);
+      const hp = white - bpState;
+      bpState = white * 0.85;
+      const sig = hp * 0.065 * accent * env;
+      addSample(s0 + j, sig * 0.9, sig * 1.1);
+    }
+  }
+
+  for (let vf = 60; vf < 468; vf += 30) {
+    if (vf >= 330 && vf < 420) continue;
+    const s0 = Math.floor(frameToSec(vf) * SAMPLE_RATE);
+    const dur = Math.floor(0.18 * SAMPLE_RATE);
+    let phase = 0;
+    for (let j = 0; j < dur; j++) {
+      const t = j / SAMPLE_RATE;
+      const fKick = 52 + 115 * Math.exp(-t * 42);
+      phase += (2 * Math.PI * fKick) / SAMPLE_RATE;
+      const env = Math.exp(-t * 14);
+      const sig = Math.sin(phase) * 0.26 * env;
+      addSample(s0 + j, sig, sig);
+    }
+  }
+
+  let bassPhase = 0;
+  for (let i = 0; i < TOTAL_SAMPLES; i++) {
+    const vf = (i / SAMPLE_RATE) * FPS - 1.0;
+    if (vf < 60 || vf >= 468) continue;
+
+    let freq = NOTE_FREQ.F2;
+    let env = 1.0;
+    if (vf >= 330 && vf < 384) {
+      freq = NOTE_FREQ.C3;
+      env = 0.85;
+    } else if (vf >= 384) {
+      freq = NOTE_FREQ.F2;
+      const beatPos = ((vf - 384) % 30) / 30.0;
+      env = Math.exp(-beatPos * 2.2);
+    } else {
+      if (vf < 120) freq = NOTE_FREQ.F2;
+      else if (vf < 240) freq = NOTE_FREQ.D3;
+      else if (vf < 330) freq = NOTE_FREQ.Bb3;
+      const beatPos = ((vf - 60) % 30) / 30.0;
+      env = Math.exp(-beatPos * 2.6);
+    }
+
+    bassPhase += (2 * Math.PI * freq) / SAMPLE_RATE;
+    const raw = Math.tanh(Math.sin(bassPhase) * 1.9) * 0.16 * env;
+    bufL[i] += raw;
+    bufR[i] += raw;
+  }
+
+  for (const vf of [6, 24, 42, 468]) {
+    const s0 = Math.floor(frameToSec(vf) * SAMPLE_RATE);
+    const dur = Math.floor(0.018 * SAMPLE_RATE);
+    for (let j = 0; j < dur; j++) {
+      const t = j / SAMPLE_RATE;
+      const env = Math.exp(-t * 260);
+      const click = (Math.sin(2 * Math.PI * 1950 * t) + 0.6 * (audioRng() * 2 - 1)) * 0.24 * env;
+      addSample(s0 + j, click, click);
+    }
+  }
+
+  for (const vf of [69, 129, 189, 249, 312]) {
+    const s0 = Math.floor(frameToSec(vf) * SAMPLE_RATE);
+    const crouchDur = (vf === 312) ? 0.28 : 0.18;
+    const samples = Math.floor(crouchDur * SAMPLE_RATE);
+    let sqPhase = 0;
+    for (let j = 0; j < samples; j++) {
+      const u = j / samples;
+      const fSq = lerp(290, 560, u) + 35 * Math.sin(u * 35);
+      sqPhase += (2 * Math.PI * fSq) / SAMPLE_RATE;
+      const env = Math.sin(u * Math.PI);
+      const squeak = Math.sin(sqPhase) * 0.065 * env;
+      const breath = (audioRng() * 2 - 1) * Math.sin(2 * Math.PI * lerp(600, 1800, u) * (j / SAMPLE_RATE)) * 0.045 * env;
+      addSample(s0 + j, squeak + breath, squeak + breath);
+    }
+  }
+
+  for (const vf of [80, 140, 200, 260, 330]) {
+    const s0 = Math.floor(frameToSec(vf) * SAMPLE_RATE);
+    const samples = Math.floor(0.24 * SAMPLE_RATE);
+    let phase = 0;
+    for (let j = 0; j < samples; j++) {
+      const u = j / samples;
+      const fSweep = lerp(180, 920, u * u);
+      phase += (2 * Math.PI * fSweep) / SAMPLE_RATE;
+      const env = Math.sin(u * Math.PI);
+      const whoosh = (Math.sin(phase) * 0.08 + (audioRng() * 2 - 1) * 0.04) * env;
+      addSample(s0 + j, whoosh, whoosh);
+    }
+  }
+
+  for (const vf of LAND_FRAMES) {
+    const s0 = Math.floor(frameToSec(vf) * SAMPLE_RATE);
+    const isFinal = (vf === 384);
+    const boost = isFinal ? 1.55 : 1.0;
+    const samples = Math.floor(0.26 * SAMPLE_RATE);
+    let rPhase = 0;
+    for (let j = 0; j < samples; j++) {
+      const t = j / SAMPLE_RATE;
+      const sqRatio = 1.0 - 0.30 * Math.exp(-5.5 * t) * Math.cos(24.0 * t);
+      const fRub = 135 / Math.max(0.55, sqRatio);
+      rPhase += (2 * Math.PI * fRub) / SAMPLE_RATE;
+      const env = Math.exp(-t * 14);
+      const rubber = Math.sin(rPhase + 0.8 * Math.sin(rPhase * 2)) * 0.16 * boost * env;
+
+      const chime = (
+        Math.sin(2 * Math.PI * 2650 * t) +
+        0.7 * Math.sin(2 * Math.PI * 3980 * t) +
+        0.5 * Math.sin(2 * Math.PI * 5420 * t)
+      ) * 0.045 * boost * Math.exp(-t * 28);
+
+      addSample(s0 + j, rubber + chime * 1.1, rubber + chime * 0.9);
+    }
+  }
+
+  const labelChimes = [
+    { vf: 69,  freq: NOTE_FREQ.A5 },
+    { vf: 140, freq: NOTE_FREQ.C6 },
+    { vf: 200, freq: NOTE_FREQ.D6 },
+    { vf: 285, freq: NOTE_FREQ.F6 },
+    { vf: 303, freq: NOTE_FREQ.A6 }
+  ];
+  for (const lc of labelChimes) {
+    const s0 = Math.floor(frameToSec(lc.vf) * SAMPLE_RATE);
+    const samples = Math.floor(0.32 * SAMPLE_RATE);
+    for (let j = 0; j < samples; j++) {
+      const t = j / SAMPLE_RATE;
+      const env = Math.exp(-t * 11.5);
+      const bell = (Math.sin(2 * Math.PI * lc.freq * t) + 0.35 * Math.sin(2 * Math.PI * lc.freq * 2 * t)) * 0.12 * env;
+      addSample(s0 + j, bell * 1.15, bell * 0.85);
+    }
+  }
+
+  for (let vf = 303; vf <= 318; vf += 1.5) {
+    const s0 = Math.floor(frameToSec(vf) * SAMPLE_RATE);
+    const dur = Math.floor(0.014 * SAMPLE_RATE);
+    for (let j = 0; j < dur; j++) {
+      const t = j / SAMPLE_RATE;
+      const tick = Math.sin(2 * Math.PI * 2400 * t) * Math.exp(-t * 280) * 0.10;
+      addSample(s0 + j, tick, tick);
+    }
+  }
+
+  {
+    const s0 = Math.floor(frameToSec(330) * SAMPLE_RATE);
+    const samples = Math.floor(((384 - 330) / FPS) * SAMPLE_RATE);
+    let wPhase = 0;
+    for (let j = 0; j < samples; j++) {
+      const u = j / samples;
+      const freq = 220 + 540 * Math.sin(u * Math.PI);
+      wPhase += (2 * Math.PI * freq) / SAMPLE_RATE;
+      const env = Math.sin(u * Math.PI);
+      const pan = Math.cos(u * Math.PI);
+      const sig = (Math.sin(wPhase) * 0.11 + (audioRng() * 2 - 1) * 0.05) * env;
+      addSample(s0 + j, sig * (0.5 - 0.35 * pan), sig * (0.5 + 0.35 * pan));
+    }
+  }
+
+  {
+    const s0 = Math.floor(frameToSec(432) * SAMPLE_RATE);
+    const samples = Math.floor(0.065 * SAMPLE_RATE);
+    for (let j = 0; j < samples; j++) {
+      const t = j / SAMPLE_RATE;
+      const fBlip = (j < samples * 0.5) ? 1480 : 1960;
+      const env = Math.exp(-t * 45);
+      const blip = Math.sin(2 * Math.PI * fBlip * t) * 0.14 * env;
+      addSample(s0 + j, blip, blip);
+    }
+  }
+
+  const outL = new Float32Array(TOTAL_SAMPLES);
+  const outR = new Float32Array(TOTAL_SAMPLES);
+  const tailSamples = Math.floor(0.25 * SAMPLE_RATE);
+
+  for (let i = 0; i < TOTAL_SAMPLES; i++) {
+    outL[i] = bufL[i];
+    outR[i] = bufR[i];
+  }
+  for (let i = 0; i < tailSamples; i++) {
+    const fade = 1.0 - i / tailSamples;
+    outL[i] += bufL[TOTAL_SAMPLES + i] * fade;
+    outR[i] += bufR[TOTAL_SAMPLES + i] * fade;
+  }
+  for (let i = 0; i < 128; i++) {
+    const w = i / 128;
+    const endIdx = TOTAL_SAMPLES - 1 - i;
+    const avgL = (outL[i] + outL[endIdx]) * 0.5;
+    const avgR = (outR[i] + outR[endIdx]) * 0.5;
+    outL[i] = lerp(avgL, outL[i], w);
+    outR[i] = lerp(avgR, outR[i], w);
+    outL[endIdx] = lerp(avgL, outL[endIdx], w);
+    outR[endIdx] = lerp(avgR, outR[endIdx], w);
+  }
+
+  let sumSq = 0;
+  for (let i = 0; i < TOTAL_SAMPLES; i++) {
+    sumSq += 0.5 * (outL[i] * outL[i] + outR[i] * outR[i]);
+  }
+  const rms = Math.sqrt(sumSq / TOTAL_SAMPLES);
+  const targetRms = Math.pow(10, -14.0 / 20.0);
+  const gain = targetRms / Math.max(1e-6, rms);
+  const ceiling = Math.pow(10, -1.0 / 20.0);
+
+  let maxPeak = 0;
+  for (let i = 0; i < TOTAL_SAMPLES; i++) {
+    let l = outL[i] * gain;
+    let r = outR[i] * gain;
+    l = ceiling * Math.tanh(l / ceiling);
+    r = ceiling * Math.tanh(r / ceiling);
+    outL[i] = l;
+    outR[i] = r;
+    maxPeak = Math.max(maxPeak, Math.abs(l), Math.abs(r));
+  }
+  if (maxPeak > 0) {
+    const normPeak = ceiling / maxPeak;
+    for (let i = 0; i < TOTAL_SAMPLES; i++) {
+      outL[i] *= normPeak;
+      outR[i] *= normPeak;
+    }
+  }
+
+  cachedStereoAudio = { left: outL, right: outR };
+  return cachedStereoAudio;
+}
+
+function createWavBlob() {
+  const { left, right } = synthesizeMasterAudio();
+  const numChannels = 2;
+  const bytesPerSample = 2;
+  const dataSize = TOTAL_SAMPLES * numChannels * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, SAMPLE_RATE, true);
+  view.setUint32(28, SAMPLE_RATE * numChannels * bytesPerSample, true);
+  view.setUint16(32, numChannels * bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < TOTAL_SAMPLES; i++) {
+    const sL = Math.max(-1, Math.min(1, left[i]));
+    const sR = Math.max(-1, Math.min(1, right[i]));
+    view.setInt16(offset, sL < 0 ? sL * 0x8000 : sL * 0x7FFF, true);
+    offset += 2;
+    view.setInt16(offset, sR < 0 ? sR * 0x8000 : sR * 0x7FFF, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+// ============================================================================
+// 12. 交互控制与 MP4 导出
+// ============================================================================
+const btnPlay = document.getElementById('btn-play');
+const btnWav = document.getElementById('btn-wav');
+const btnMp4 = document.getElementById('btn-mp4');
+const scrubber = document.getElementById('scrubber');
+const frameReadout = document.getElementById('frame-readout');
+const statusBanner = document.getElementById('status-banner');
+
+let audioCtx = null;
+let audioSource = null;
+let audioStartWallTime = 0;
+let pauseOffsetSec = 0;
+let isPlaying = false;
+let isExporting = false;
+
+function updateReadout(tSec) {
+  const f = Math.round(((tSec % DURATION) + DURATION) % DURATION * FPS) % TOTAL_FRAMES;
+  scrubber.value = f;
+  frameReadout.textContent = `F: ${String(f).padStart(3, '0')} / 480 (${(f / FPS).toFixed(2)}s)`;
+}
+
+function startPlayback() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  const { left, right } = synthesizeMasterAudio();
+  const audioBuffer = audioCtx.createBuffer(2, TOTAL_SAMPLES, SAMPLE_RATE);
+  audioBuffer.getChannelData(0).set(left);
+  audioBuffer.getChannelData(1).set(right);
+
+  if (audioSource) {
+    try { audioSource.stop(); } catch (_) {}
+  }
+  audioSource = audioCtx.createBufferSource();
+  audioSource.buffer = audioBuffer;
+  audioSource.loop = true;
+  audioSource.connect(audioCtx.destination);
+
+  const offset = ((pauseOffsetSec % DURATION) + DURATION) % DURATION;
+  audioStartWallTime = audioCtx.currentTime - offset;
+  audioSource.start(0, offset);
+  isPlaying = true;
+  btnPlay.textContent = '⏸ 暂停';
+}
+
+function stopPlayback() {
+  if (audioSource && audioCtx) {
+    pauseOffsetSec = (audioCtx.currentTime - audioStartWallTime) % DURATION;
+    try { audioSource.stop(); } catch (_) {}
+    audioSource = null;
+  }
+  isPlaying = false;
+  btnPlay.textContent = '▶ 播放';
+}
+
+btnPlay.addEventListener('click', () => {
+  if (isExporting) return;
+  if (isPlaying) stopPlayback();
+  else startPlayback();
+});
+
+scrubber.addEventListener('input', () => {
+  if (isExporting) return;
+  if (isPlaying) stopPlayback();
+  const f = Number(scrubber.value);
+  pauseOffsetSec = (f / FPS) % DURATION;
+  window.renderAt(pauseOffsetSec);
+  frameReadout.textContent = `F: ${String(f).padStart(3, '0')} / 480 (${(f / FPS).toFixed(2)}s)`;
+});
+
+btnWav.addEventListener('click', () => {
+  statusBanner.textContent = '正在生成 48 kHz 立体声 WAV 音频...';
+  setTimeout(() => {
+    const blob = createWavBlob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'claude_raytraced_studio_48kHz.wav';
+    a.click();
+    statusBanner.textContent = '已导出 48 kHz 立体声 WAV（-14 LUFS / -1 dBTP 无缝循环）';
+  }, 20);
+});
+
+btnMp4.addEventListener('click', async () => {
+  if (isExporting) return;
+  if (isPlaying) stopPlayback();
+
+  if (typeof VideoEncoder === 'undefined' || typeof AudioEncoder === 'undefined') {
+    statusBanner.textContent = '当前浏览器不支持 WebCodecs VideoEncoder/AudioEncoder，请使用最新版 Chrome 或 Edge 导出 MP4。';
+    return;
+  }
+
+  isExporting = true;
+  btnPlay.disabled = true;
+  btnWav.disabled = true;
+  btnMp4.disabled = true;
+
+  try {
+    statusBanner.textContent = '正在初始化光追 MP4 硬件编码器与 48kHz 音轨...';
+    const { left, right } = synthesizeMasterAudio();
+
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: { codec: 'avc', width: WIDTH, height: HEIGHT },
+      audio: { codec: 'aac', numberOfChannels: 2, sampleRate: SAMPLE_RATE },
+      fastStart: 'in-memory'
+    });
+
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => console.error(e)
+    });
+    videoEncoder.configure({
+      codec: 'avc1.640028',
+      width: WIDTH,
+      height: HEIGHT,
+      bitrate: 14_000_000,
+      framerate: FPS
+    });
+
+    const audioEncoder = new AudioEncoder({
+      output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+      error: (e) => console.error(e)
+    });
+    audioEncoder.configure({
+      codec: 'mp4a.40.2',
+      numberOfChannels: 2,
+      sampleRate: SAMPLE_RATE,
+      bitrate: 192_000
+    });
+
+    const chunkFrames = 4800;
+    for (let offset = 0; offset < TOTAL_SAMPLES; offset += chunkFrames) {
+      const len = Math.min(chunkFrames, TOTAL_SAMPLES - offset);
+      const planar = new Float32Array(len * 2);
+      planar.set(left.subarray(offset, offset + len), 0);
+      planar.set(right.subarray(offset, offset + len), len);
+
+      const audioData = new AudioData({
+        format: 'f32-planar',
+        sampleRate: SAMPLE_RATE,
+        numberOfFrames: len,
+        numberOfChannels: 2,
+        timestamp: Math.round((offset / SAMPLE_RATE) * 1_000_000),
+        data: planar
+      });
+      audioEncoder.encode(audioData);
+      audioData.close();
+    }
+    await audioEncoder.flush();
+
+    for (let f = 0; f < TOTAL_FRAMES; f++) {
+      const t = f / FPS;
+      window.renderAt(t);
+      updateReadout(t);
+
+      const vf = new VideoFrame(mainCanvas, {
+        timestamp: Math.round(t * 1_000_000),
+        duration: Math.round((1 / FPS) * 1_000_000)
+      });
+      videoEncoder.encode(vf, { keyFrame: f % 60 === 0 });
+      vf.close();
+
+      if (f % 10 === 0) {
+        statusBanner.textContent = `正在光追渲染合成 MP4: ${f} / ${TOTAL_FRAMES} 帧 (${Math.round((f / TOTAL_FRAMES) * 100)}%)...`;
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    await videoEncoder.flush();
+    muxer.finalize();
+
+    const mp4Blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(mp4Blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'claude_raytraced_studio_1080p_60fps.mp4';
+    a.click();
+
+    statusBanner.textContent = '光追 MP4 音视频封装完成并已开始下载！';
+  } catch (err) {
+    console.error(err);
+    statusBanner.textContent = 'MP4 导出出错: ' + err.message;
+  } finally {
+    isExporting = false;
+    btnPlay.disabled = false;
+    btnWav.disabled = false;
+    btnMp4.disabled = false;
+  }
+});
+
+function tick() {
+  if (isPlaying && audioCtx && !isExporting) {
+    const elapsed = (audioCtx.currentTime - audioStartWallTime) / DURATION;
+    const currentT = (audioCtx.currentTime - audioStartWallTime) % DURATION;
+    window.renderAt(currentT);
+    updateReadout(currentT);
+  }
+  requestAnimationFrame(tick);
+}
+
+document.fonts.ready.then(() => {
+  window.renderAt(0);
+  updateReadout(0);
+  requestAnimationFrame(tick);
+});
+</script>
+</body>
+</html>
